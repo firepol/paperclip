@@ -1,0 +1,39 @@
+[Unit]
+Description=Paperclip AI Server
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/ai-lab/paperclip
+
+# PAPERCLIP_HOME is used for status files, secrets, and local storage.
+Environment=PAPERCLIP_HOME=/var/lib/paperclip
+Environment=NODE_ENV=production
+
+# We call the wrapper script instead of node directly to ensure fnm/pnpm PATHs are loaded
+ExecStart=/home/ai/ai-lab/paperclip/scripts/run-server.sh
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+# ProtectSystem=strict mounts the filesystem as read-only.
+ProtectSystem=strict
+
+# Paths needed for reading code, environment initialization, and agent binaries
+ReadOnlyPaths=/home/ai/ai-lab/paperclip /home/ai/.bashrc /home/ai/.local/share/fnm /home/ai/.local/share/pnpm
+
+# Paths needed for writing data and agent session state
+ReadWritePaths=/var/lib/paperclip /home/ai/ai-lab/paperclip/.paperclip /home/ai/.config /home/ai/.local
+
+[Install]
+WantedBy=multi-user.target
