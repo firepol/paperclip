@@ -1144,7 +1144,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  delete agentParams.paperclip;
+  // PATCH: Don't send paperclip property as OpenClaw rejects it
+  // agentParams.paperclip = paperclipPayload;
 
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
     agentParams.agentId = configuredAgentId;
