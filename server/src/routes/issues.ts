@@ -6913,6 +6913,7 @@ export function issueRoutes(
       scheduledRetry,
       attachments,
       continuationSummary,
+      userDocuments,
       currentExecutionWorkspace,
       activeRecoveryAction,
     ] =
@@ -6928,6 +6929,7 @@ export function issueRoutes(
         svc.getCurrentScheduledRetry(issue.id),
         svc.listAttachments(issue.id),
         documentsSvc.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
+        documentsSvc.listIssueDocuments(issue.id),
         currentExecutionWorkspacePromise,
         recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       ]);
@@ -7079,6 +7081,15 @@ export function issueRoutes(
         : null,
       planReviewContext,
       documentReviewContext,
+      documents: userDocuments.map((doc) => ({
+        key: doc.key,
+        title: doc.title,
+        format: doc.format,
+        body: typeof doc.body === "string" && doc.body.length <= ATTACHMENT_INLINE_MAX_BYTES ? doc.body : null,
+        latestRevisionId: doc.latestRevisionId,
+        latestRevisionNumber: doc.latestRevisionNumber,
+        updatedAt: doc.updatedAt,
+      })),
       currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
     };
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, response));
