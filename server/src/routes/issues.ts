@@ -88,6 +88,7 @@ import {
   normalizeIssueAttachmentMaxBytes,
   normalizeContentType,
   SVG_CONTENT_TYPE,
+  ATTACHMENT_INLINE_MAX_BYTES,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
@@ -1722,14 +1723,50 @@ export function issueRoutes(
         wakeComment && wakeComment.issueId === issue.id
           ? wakeComment
           : null,
-      attachments: attachments.map((a) => ({
-        id: a.id,
-        filename: a.originalFilename,
-        contentType: a.contentType,
-        byteSize: a.byteSize,
-        contentPath: withContentPath(a).contentPath,
-        createdAt: a.createdAt,
-      })),
+      attachments: await (async () => {
+        // Pre-select which attachments to inline using an aggregate byte budget.
+        // Attachments are processed in createdAt order; once the running total
+        // would exceed ATTACHMENT_INLINE_MAX_BYTES the remaining ones are skipped
+        // (they still appear in the response with contentPath for the agent to fetch).
+        const inlineIds = new Set<string>();
+        let inlineBudgetRemaining = ATTACHMENT_INLINE_MAX_BYTES;
+        for (const a of attachments) {
+          const isInlineable =
+            a.contentType === "text/plain" ||
+            a.contentType === "text/markdown" ||
+            a.contentType === "application/json" ||
+            a.contentType === "text/csv";
+          const size = a.byteSize ?? null;
+          if (isInlineable && size != null && size <= inlineBudgetRemaining) {
+            inlineIds.add(a.id);
+            inlineBudgetRemaining -= size;
+          }
+        }
+        return Promise.all(attachments.map(async (a) => {
+          let inlineContent: string | null = null;
+          if (inlineIds.has(a.id)) {
+            try {
+              const obj = await storage.getObject(a.companyId, a.objectKey);
+              const chunks: Buffer[] = [];
+              for await (const chunk of obj.stream) {
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+              }
+              inlineContent = Buffer.concat(chunks).toString("utf-8");
+            } catch {
+              // storage error — omit inlineContent rather than failing the whole response
+            }
+          }
+          return {
+            id: a.id,
+            filename: a.originalFilename,
+            contentType: a.contentType,
+            byteSize: a.byteSize,
+            contentPath: withContentPath(a).contentPath,
+            createdAt: a.createdAt,
+            ...(inlineContent !== null ? { inlineContent } : {}),
+          };
+        }));
+      })(),
       continuationSummary: continuationSummary
         ? {
             key: continuationSummary.key,
