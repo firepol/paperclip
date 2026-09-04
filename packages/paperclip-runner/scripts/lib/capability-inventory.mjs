@@ -247,7 +247,9 @@ export async function buildMcpInventory(repoRoot) {
 
 export function validateInventories(inventories) {
   const errors = [];
-  const expectedCounts = { capabilities: 152, evaluations: 106, legacyMcpAliases: 42 };
+  // 153, not upstream's 152: this fork adds an "Attachments" section to
+  // skills/paperclip/references/api-reference.md (PR #6042 attachment/document support).
+  const expectedCounts = { capabilities: 153, evaluations: 106, legacyMcpAliases: 42 };
   const normativeNames = ["capabilities", "evaluations"];
   const normativeRows = new Map();
   const globalNormativeIds = new Set();
