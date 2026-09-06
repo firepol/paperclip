@@ -32,6 +32,7 @@ import {
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
   referencedSourceContentSignature,
+  resolveCodexCliBinaryForAcp,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
@@ -556,6 +557,57 @@ describe("shared ACPX engine runtime behavior", () => {
 
     expect((meta[0]?.env as Record<string, string>).CODEX_CONFIG).toBeUndefined();
     expect(configOptions).toEqual([]);
+  });
+
+  it("points Codex ACP at the configured Codex CLI via CODEX_PATH", async () => {
+    const root = await makeTempRoot();
+    const codexBin = path.join(root, "bin", "codex");
+    await fs.mkdir(path.dirname(codexBin), { recursive: true });
+    await fs.writeFile(codexBin, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+
+    const { meta } = await runExecutor({
+      agent: "codex",
+      model: "gpt-6-astra",
+      command: codexBin,
+    });
+
+    expect((meta[0]?.env as Record<string, string>).CODEX_PATH).toBe(codexBin);
+  });
+
+  it("keeps an explicit CODEX_PATH from adapter config", async () => {
+    const root = await makeTempRoot();
+    const configured = path.join(root, "bin", "codex");
+    await fs.mkdir(path.dirname(configured), { recursive: true });
+    await fs.writeFile(configured, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+    const override = path.join(root, "bin", "codex-override");
+    await fs.writeFile(override, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+
+    const { meta } = await runExecutor({
+      agent: "codex",
+      command: configured,
+      env: { CODEX_PATH: override },
+    });
+
+    expect((meta[0]?.env as Record<string, string>).CODEX_PATH).toBe(override);
+  });
+
+  it("warns and leaves CODEX_PATH unset when the Codex CLI cannot be resolved", async () => {
+    const root = await makeTempRoot();
+    const missing = path.join(root, "bin", "codex");
+
+    const { logs, meta } = await runExecutor({ agent: "codex", command: missing });
+
+    expect((meta[0]?.env as Record<string, string>).CODEX_PATH).toBeUndefined();
+    expect(logs).toContainEqual({
+      stream: "stderr",
+      text: `[paperclip] Codex CLI "${missing}" not found on PATH; Codex ACP will run the Codex build bundled with codex-acp, which may not support newer models. Install Codex or set adapter config env.CODEX_PATH.\n`,
+    });
+  });
+
+  it("does not set CODEX_PATH for non-codex ACPX agents", async () => {
+    const { meta } = await runExecutor({ agent: "claude", model: "claude-opus-4-7" });
+
+    expect((meta[0]?.env as Record<string, string>).CODEX_PATH).toBeUndefined();
   });
 
   it("includes Paperclip env and API access notes in the ACPX prompt without leaking the token", async () => {
@@ -2374,6 +2426,68 @@ describe("findAncestorBin", () => {
   it("terminates at the filesystem root instead of looping forever", async () => {
     const resolved = await findAncestorBin("/", "definitely-not-a-real-bin-name-xyz");
     expect(resolved).toBeNull();
+  });
+});
+
+describe("resolveCodexCliBinaryForAcp", () => {
+  async function writeCodexBin(dir: string, name = "codex") {
+    await fs.mkdir(dir, { recursive: true });
+    const binPath = path.join(dir, name);
+    await fs.writeFile(binPath, "#!/usr/bin/env bash\necho ok\n", { mode: 0o755 });
+    return binPath;
+  }
+
+  it("resolves a bare command through PATH", async () => {
+    const root = await makeTempRoot();
+    const binDir = path.join(root, "bin");
+    const expected = await writeCodexBin(binDir);
+
+    const resolved = await resolveCodexCliBinaryForAcp("codex", {
+      PATH: [path.join(root, "missing"), binDir].join(path.delimiter),
+    });
+
+    expect(resolved).toBe(expected);
+  });
+
+  it("resolves an absolute command path that exists", async () => {
+    const root = await makeTempRoot();
+    const expected = await writeCodexBin(path.join(root, "opt"), "codex-next");
+
+    expect(await resolveCodexCliBinaryForAcp(expected, { PATH: "" })).toBe(expected);
+  });
+
+  it("returns null for an absolute command path that does not exist", async () => {
+    const root = await makeTempRoot();
+    const missing = path.join(root, "opt", "codex-next");
+
+    expect(await resolveCodexCliBinaryForAcp(missing, { PATH: "" })).toBeNull();
+  });
+
+  it("returns null when the command is not on PATH so codex-acp keeps its bundled fallback", async () => {
+    const root = await makeTempRoot();
+
+    expect(
+      await resolveCodexCliBinaryForAcp("codex", { PATH: path.join(root, "empty") }),
+    ).toBeNull();
+  });
+
+  it("returns null for shell-style commands codex-acp cannot spawn as argv[0]", async () => {
+    const root = await makeTempRoot();
+    const binDir = path.join(root, "bin");
+    await writeCodexBin(binDir);
+
+    expect(
+      await resolveCodexCliBinaryForAcp("codex --profile work", { PATH: binDir }),
+    ).toBeNull();
+    expect(await resolveCodexCliBinaryForAcp("   ", { PATH: binDir })).toBeNull();
+  });
+
+  it("does not resolve a directory that shares the command name", async () => {
+    const root = await makeTempRoot();
+    const binDir = path.join(root, "bin");
+    await fs.mkdir(path.join(binDir, "codex"), { recursive: true });
+
+    expect(await resolveCodexCliBinaryForAcp("codex", { PATH: binDir })).toBeNull();
   });
 });
 

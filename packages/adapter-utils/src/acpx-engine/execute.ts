@@ -1370,6 +1370,51 @@ function normalizeRequestedThinkingEffort(config: Record<string, unknown>): stri
   ).trim();
 }
 
+/**
+ * Resolve the Codex CLI binary the ACP lane should drive.
+ *
+ * `@agentclientprotocol/codex-acp` is only a protocol shim: it spawns
+ * `<codex> app-server` and talks JSON-RPC to it. When `CODEX_PATH` is unset it
+ * falls back to the `@openai/codex` build pinned inside its own dependency
+ * tree, which lags the Codex release the operator actually installed. That
+ * stale core is what rejects newly launched models with
+ * "The '<model>' model requires a newer version of Codex" (plus a
+ * "Model metadata for `<model>` not found" warning) even though the same model
+ * works on the CLI lane, which runs `config.command` (default `codex`) from
+ * PATH. Pointing `CODEX_PATH` at that same binary keeps both lanes on one Codex
+ * version, so upgrading Codex is all it takes to pick up a new model.
+ *
+ * Returns `null` when the command can't be resolved to a real file (no local
+ * install, or a shell-style command that `codex-acp` can't spawn as argv[0]);
+ * the caller then leaves `CODEX_PATH` unset and codex-acp keeps its bundled
+ * fallback.
+ */
+export async function resolveCodexCliBinaryForAcp(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  // codex-acp spawns the path directly (no shell on POSIX), so a command with
+  // arguments or shell syntax can't be handed over as CODEX_PATH.
+  if (/\s/.test(trimmed)) return null;
+  const exists = async (candidate: string): Promise<boolean> =>
+    fs
+      .stat(candidate)
+      .then((stat) => stat.isFile())
+      .catch(() => false);
+  if (path.isAbsolute(trimmed) || trimmed.includes("/") || trimmed.includes("\\")) {
+    const resolved = path.resolve(trimmed);
+    return (await exists(resolved)) ? resolved : null;
+  }
+  for (const segment of (env.PATH ?? "").split(path.delimiter)) {
+    if (!segment) continue;
+    const candidate = path.join(segment, trimmed);
+    if (await exists(candidate)) return candidate;
+  }
+  return null;
+}
+
 function buildCodexStartupConfig(input: {
   existingConfig: string | undefined;
   requestedModel: string;
@@ -1929,6 +1974,23 @@ async function buildRuntime(input: {
       );
     }
     if (codexStartupConfig.value) env.CODEX_CONFIG = codexStartupConfig.value;
+    // Drive the operator's installed Codex CLI instead of the older core pinned
+    // inside codex-acp — see resolveCodexCliBinaryForAcp. Only for local
+    // targets: on a remote target this path would be a host path the sandbox
+    // can't see, and there codex-acp resolves its own installed Codex. An
+    // explicit env.CODEX_PATH from adapter config always wins.
+    if (!executionTargetIsRemote && !env.CODEX_PATH) {
+      const codexCommand = asString(config.command, "codex");
+      const codexBinary = await resolveCodexCliBinaryForAcp(codexCommand, process.env);
+      if (codexBinary) {
+        env.CODEX_PATH = codexBinary;
+      } else {
+        await input.ctx.onLog(
+          "stderr",
+          `[paperclip] Codex CLI "${codexCommand}" not found on PATH; Codex ACP will run the Codex build bundled with codex-acp, which may not support newer models. Install Codex or set adapter config env.CODEX_PATH.\n`,
+        );
+      }
+    }
   }
 
   let skillPromptInstructions = "";
