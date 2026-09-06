@@ -2,6 +2,25 @@ import { describe, expect, it } from "vitest";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 
+// Minimal Drizzle stub covering every builder chain buildPaperclipWakePayload
+// uses, each resolving to no rows: `.from().where()` for the issue lookup and
+// `.from().innerJoin().where().orderBy()` for attachments and documents.
+function emptyResultDb() {
+  const noRows = async () => [];
+  return {
+    select: () => ({
+      from: () => ({
+        where: noRows,
+        innerJoin: () => ({
+          where: () => ({
+            orderBy: noRows,
+          }),
+        }),
+      }),
+    }),
+  } as never;
+}
+
 describe("agent session wake messages", () => {
   it("includes the issue brief and requires fallback fetch when a long description is truncated", async () => {
     const description = [
@@ -10,13 +29,7 @@ describe("agent session wake messages", () => {
     ].join("\n");
 
     const wakePayload = await buildPaperclipWakePayload({
-      db: {
-        select: () => ({
-          from: () => ({
-            where: async () => [],
-          }),
-        }),
-      } as never,
+      db: emptyResultDb(),
       companyId: "company-1",
       contextSnapshot: {
         wakeReason: "issue_assigned",
