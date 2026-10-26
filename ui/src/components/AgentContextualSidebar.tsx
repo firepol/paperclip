@@ -6,6 +6,7 @@ import {
   History,
   KeyRound,
   Library,
+  MessageSquare,
   PlayCircle,
   ReceiptText,
   Settings2,
@@ -13,6 +14,7 @@ import {
   Sparkles,
   Wrench,
 } from "lucide-react";
+import { usePluginSlots } from "@/plugins/slots";
 import { agentsApi } from "@/api/agents";
 import { useCompany } from "@/context/CompanyContext";
 import { queryKeys } from "@/lib/queryKeys";
@@ -33,6 +35,7 @@ const localIcons = {
   runtime: Settings2,
   secrets: ShieldCheck,
   tools: Wrench,
+  channels: MessageSquare,
   permissions: ShieldCheck,
   "api-keys": KeyRound,
   revisions: History,
@@ -49,10 +52,12 @@ export function AgentContextualSidebar({
   agentRef,
   agentId,
   agentName,
+  labels = { secrets: "Secrets & variables" },
 }: {
   agentRef: string;
   agentId?: string;
   agentName?: string;
+  labels?: Partial<Record<AgentLocalDetailView, string>>;
 }) {
   const { selectedCompanyId } = useCompany();
   const shouldResolveAgent = !agentId || !agentName;
@@ -62,6 +67,7 @@ export function AgentContextualSidebar({
     enabled: shouldResolveAgent && Boolean(agentRef && selectedCompanyId),
   });
   const resolvedId = agentId ?? resolvedAgent?.id;
+  const { slots: pluginTabs } = usePluginSlots({ slotTypes: ["detailTab"], entityType: "agent", companyId: resolvedAgent?.companyId ?? selectedCompanyId, enabled: Boolean(resolvedId) });
   const resolvedName = agentName ?? resolvedAgent?.name ?? "Agent";
 
   return (
@@ -90,21 +96,28 @@ export function AgentContextualSidebar({
               {section.label}
             </p>
             <div data-slot="contextual-sidebar-group" className={contextualSidebarStyles.group}>
-              {section.items.map((item) => {
-                const href = agentDetailHref(agentRef, item.value);
-                return (
-                  <SidebarNavItem
-                    key={item.value}
-                    to={href}
-                    label={item.label}
-                    icon={localIcons[item.value]}
-                  />
-                );
-              })}
+              {section.items
+                .map((item) => {
+                  const href = agentDetailHref(agentRef, item.value);
+                  return (
+                    <SidebarNavItem
+                      key={item.value}
+                      to={href}
+                      label={labels?.[item.value] ?? item.label}
+                      icon={localIcons[item.value]}
+                    />
+                  );
+                })}
             </div>
           </div>
         ))}
 
+        {pluginTabs.length > 0 && <div data-slot="contextual-sidebar-section" className={contextualSidebarStyles.section}>
+          <p className={contextualSidebarStyles.sectionLabel}>Apps</p>
+          <div className={contextualSidebarStyles.group}>
+            {pluginTabs.map(slot => <SidebarNavItem key={`${slot.pluginKey}:${slot.id}`} to={`/agents/${encodeURIComponent(agentRef)}/${encodeURIComponent(`plugin:${slot.pluginKey}:${slot.id}`)}`} label={slot.displayName} icon={Wrench} />)}
+          </div>
+        </div>}
         <div data-slot="contextual-sidebar-section" className={contextualSidebarStyles.section}>
           <p
             data-slot="contextual-sidebar-section-label"

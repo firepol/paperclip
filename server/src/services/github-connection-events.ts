@@ -1,3 +1,6 @@
+import { dispatchGitHubBotCloudEvent } from "./chat-github-cloud-ingress.js";
+import { chatEndpoints } from "@paperclipai/db";
+import { randomUUID } from "node:crypto";
 import {
   connectionEventDeliveries,
   connectionGrants,
@@ -218,6 +221,8 @@ export function githubConnectionEventService(
   const now = options.now ?? (() => new Date());
   let nextPollAt = 0;
   let emptyPolls = 0;
+  let nextSetupPollAt = 0;
+  let inFlight: Promise<GitHubConnectionEventPollResult> | null = null;
 
   async function activeBindings() {
     const rows = await db.select({ grant: connectionGrants, connection: toolConnections })
@@ -269,7 +274,28 @@ export function githubConnectionEventService(
   }
 
   async function applyInstallationEvent(database: Db, binding: GitHubBinding, event: LeasedEvent) {
-    const github = binding.providerTenant.github!;
+    // Bindings are loaded before the Cloud request. Lock and read the grant
+    // again so a refresh completed during that request cannot be overwritten.
+    const [currentGrant] = await database.select().from(connectionGrants).where(and(
+      eq(connectionGrants.id, binding.grantId),
+      eq(connectionGrants.companyId, binding.companyId),
+      eq(connectionGrants.status, "active"),
+    )).for("update").limit(1);
+    const currentProviderTenant = currentGrant?.providerTenant;
+    const github = currentProviderTenant?.github;
+    if (!github) return;
+    // A newly bound instance can receive installation events from before OAuth
+    // verified its repository list. Those events must not erase newer access.
+    if (Date.parse(github.lastAccessRefreshAt ?? "") > Date.parse(event.createdAt)) {
+      await database.update(connectionGrants).set({
+        providerTenant: {
+          ...currentProviderTenant,
+          github: { ...github, lastWebhookAt: now().toISOString(), webhookHealth: "healthy" },
+        },
+        updatedAt: now(),
+      }).where(and(eq(connectionGrants.id, binding.grantId), eq(connectionGrants.companyId, binding.companyId)));
+      return;
+    }
     const unavailable = event.event === "installation" && (event.action === "deleted" || event.action === "suspend");
     const installationIds = unavailable
       ? github.installationIds.filter((id) => id !== binding.installationId)
@@ -285,9 +311,13 @@ export function githubConnectionEventService(
           : github.repositoryCount + added - removed,
     );
     const providerTenant = {
-      ...binding.providerTenant,
+      ...currentProviderTenant,
       github: {
         ...github,
+        // Lifecycle webhooks carry IDs, not the user token’s complete repository view.
+        // Discard the snapshot until Refresh access verifies it again.
+        accessRevision: randomUUID(),
+        repositories: undefined,
         installationIds,
         installationCount: installationIds.length,
         repositoryCount,
@@ -353,12 +383,19 @@ export function githubConnectionEventService(
             const github = binding.providerTenant.github;
             if (!github) continue;
             await database.update(connectionGrants).set({
-              providerTenant: {
-                ...binding.providerTenant,
-                github: { ...github, lastWebhookAt: touchedAt.toISOString(), webhookHealth: "healthy" },
-              },
+              // Update only webhook fields; a concurrent access/token refresh
+              // owns the remaining metadata and must not be replaced here.
+              providerTenant: sql`jsonb_set(${connectionGrants.providerTenant}, '{github}',
+                (${connectionGrants.providerTenant}->'github') || ${JSON.stringify({
+                  lastWebhookAt: touchedAt.toISOString(), webhookHealth: "healthy",
+                })}::jsonb)`,
               updatedAt: touchedAt,
-            }).where(and(eq(connectionGrants.id, binding.grantId), eq(connectionGrants.companyId, companyId)));
+            }).where(and(
+              eq(connectionGrants.id, binding.grantId),
+              eq(connectionGrants.companyId, companyId),
+              eq(connectionGrants.status, "active"),
+              sql`${connectionGrants.providerTenant}->'github' is not null`,
+            ));
           }
         }
         const finishedAt = now();
@@ -423,78 +460,101 @@ export function githubConnectionEventService(
     return "processed" as const;
   }
 
-  return {
-    async pollOnce(): Promise<GitHubConnectionEventPollResult> {
-      if (now().getTime() < nextPollAt) {
-        return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
-      }
-      const bindings = await activeBindings();
-      if (bindings.length === 0) {
-        nextPollAt = now().getTime() + 5 * 60_000;
-        return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
-      }
-      const config = options.connector ? null : paperclipCloudConnectorConfigFromEnv(options.env);
-      const connector = options.connector ?? (config ? createPaperclipCloudConnector({ config }) : null);
-      if (!connector) {
-        nextPollAt = now().getTime() + 5 * 60_000;
-        return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
-      }
-      const first = bindings[0]!;
-      const lease = await connector.leaseEvents({ subject: first.subject, companyId: first.companyId });
-      if (!lease) {
-        emptyPolls += 1;
-        nextPollAt = now().getTime() + Math.min(5 * 60_000, 5_000 * (2 ** Math.min(emptyPolls, 6)));
-        return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
-      }
-      emptyPolls = 0;
+  async function runPoll(): Promise<GitHubConnectionEventPollResult> {
+    const bindings = await activeBindings();
+    const bots = await db.select().from(chatEndpoints).where(and(eq(chatEndpoints.provider, "github"), sql`${chatEndpoints.setup}->'github'->>'cloudRegistrationId' is not null`, sql`${chatEndpoints.status} <> 'archived'`));
+    if (bindings.length === 0 && bots.length === 0) {
       nextPollAt = now().getTime() + 5_000;
-      const result: GitHubConnectionEventPollResult = {
-        leased: lease.events.length,
-        processed: 0,
-        duplicate: 0,
-        ignored: 0,
-        failed: 0,
-      };
-      const acknowledge: string[] = [];
-      for (const event of lease.events) {
-        const matched = bindings.filter((binding) => event.bindingIds.includes(binding.id));
-        if (matched.length === 0) {
-          result.ignored += 1;
-          acknowledge.push(event.id);
-          continue;
-        }
-        try {
-          const companies = new Map<string, GitHubBinding[]>();
-          for (const binding of matched) companies.set(binding.companyId, [...(companies.get(binding.companyId) ?? []), binding]);
-          for (const [companyId, companyBindings] of companies) {
-            const status = await processForCompany(companyId, companyBindings, event);
-            result[status] += 1;
-          }
-          acknowledge.push(event.id);
-          if (event.event === "installation" && (event.action === "deleted" || event.action === "suspend")) {
-            await Promise.all(matched.map((binding) => connector.setWebhookBinding({
-              subject: binding.subject,
-              companyId: binding.companyId,
-              id: binding.id,
-              installationId: binding.installationId,
-              connectionId: binding.connectionId,
-              grantId: binding.grantId,
-              active: false,
-            })));
-          }
-        } catch {
-          result.failed += 1;
-        }
+      return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
+    }
+    const config = options.connector ? null : paperclipCloudConnectorConfigFromEnv(options.env);
+    const connector = options.connector ?? (config ? createPaperclipCloudConnector({ config }) : null);
+    if (!connector) {
+      nextPollAt = now().getTime() + 5 * 60_000;
+      return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
+    }
+    const first = bindings[0] ?? { subject: "github-bot-events", companyId: bots[0]!.companyId };
+    const lease = await connector.leaseEvents({ subject: first.subject, companyId: first.companyId });
+    if (!lease) {
+      emptyPolls += 1;
+      nextPollAt = now().getTime() + Math.min(bots.length ? 15_000 : 5 * 60_000, 5_000 * (2 ** Math.min(emptyPolls, 6)));
+      return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
+    }
+    emptyPolls = 0;
+    nextPollAt = now().getTime() + 5_000;
+    const result: GitHubConnectionEventPollResult = {
+      leased: lease.events.length + (lease.failedEventIds?.length ?? 0),
+      processed: 0,
+      duplicate: 0,
+      ignored: 0,
+      failed: lease.failedEventIds?.length ?? 0,
+    };
+    const acknowledge: string[] = [];
+    for (const event of lease.events) {
+      if (event.payload.githubApp !== undefined) {
+        try { await dispatchGitHubBotCloudEvent(db, event); acknowledge.push(event.id); result.processed += 1; }
+        catch { result.failed += 1; }
+        continue;
       }
-      if (acknowledge.length > 0) {
-        await connector.acknowledgeEvents({
-          subject: first.subject,
-          companyId: first.companyId,
-          leaseId: lease.leaseId,
-          deliveryIds: acknowledge,
-        });
+      const matched = bindings.filter((binding) => event.bindingIds.includes(binding.id));
+      if (matched.length === 0) {
+        result.ignored += 1;
+        acknowledge.push(event.id);
+        continue;
       }
-      return result;
+      try {
+        const companies = new Map<string, GitHubBinding[]>();
+        for (const binding of matched) companies.set(binding.companyId, [...(companies.get(binding.companyId) ?? []), binding]);
+        for (const [companyId, companyBindings] of companies) {
+          const status = await processForCompany(companyId, companyBindings, event);
+          result[status] += 1;
+        }
+        acknowledge.push(event.id);
+        if (event.event === "installation" && (event.action === "deleted" || event.action === "suspend")) {
+          await Promise.all(matched.map((binding) => connector.setWebhookBinding({
+            subject: binding.subject,
+            companyId: binding.companyId,
+            id: binding.id,
+            installationId: binding.installationId,
+            connectionId: binding.connectionId,
+            grantId: binding.grantId,
+            active: false,
+          })));
+        }
+      } catch {
+        result.failed += 1;
+      }
+    }
+    if (acknowledge.length > 0) {
+      await connector.acknowledgeEvents({
+        subject: first.subject,
+        companyId: first.companyId,
+        leaseId: lease.leaseId,
+        deliveryIds: acknowledge,
+      });
+    }
+    for (const deliveryId of lease.failedEventIds ?? []) {
+      logger.warn({ deliveryId, reason: "inner_event_authentication_failed" },
+        "GitHub connector event retained for retry");
+    }
+    return result;
+  }
+
+  return {
+    pollOnce(input: { forSetup?: boolean } = {}): Promise<GitHubConnectionEventPollResult> {
+      // A manager actively awaiting a dedicated App's signed ping must not
+      // inherit a personal connection's old empty-queue backoff. This is a
+      // bounded readiness probe, not an additional background polling loop.
+      if (inFlight) return inFlight;
+      const time = now().getTime();
+      if (time < (input.forSetup ? nextSetupPollAt : nextPollAt)) {
+        return Promise.resolve({ leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 });
+      }
+      nextSetupPollAt = time + 5_000;
+      nextPollAt = Math.max(nextPollAt, nextSetupPollAt);
+      const work = runPoll().finally(() => { if (inFlight === work) inFlight = null; });
+      inFlight = work;
+      return work;
     },
   };
 }

@@ -1,3 +1,5 @@
+import { writeLoginCleanup } from "./login-cleanup-notifications.js";
+import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -172,7 +174,10 @@ export interface CredentialPromotion {
    * the service records a failed login instead of `authenticated` and never
    * runs `commit`. A promotion that omits this runs `commit` directly.
    */
-  runTerminalCommit?<T>(commit: () => Promise<T>, context: CredentialPromotionContext): Promise<T>;
+  runTerminalCommit?<T>(
+    commit: (resultClaim?: Record<string, unknown>) => Promise<T>,
+    context: CredentialPromotionContext,
+  ): Promise<T>;
 }
 
 /** The redacted lifecycle phases. Each phase carries no secret data. */
@@ -205,6 +210,7 @@ export interface LoginSessionActivityEvent {
 export type LoginSessionActivityRecorder = (event: LoginSessionActivityEvent) => void;
 
 export interface StartDeviceLoginInput {
+  aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent;
   companyId: string;
   environmentId: string;
   adapterType: AgentAdapterType;
@@ -259,6 +265,7 @@ export class AdapterAuthSessionConflictError extends Error {
 // ---------------------------------------------------------------------------
 
 export interface AdapterAuthSessionRow {
+  aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent;
   id: string;
   /** The public, CSPRNG session identifier. The API returns and looks up this
    *  value. It never equals the internal primary-key `id`, so a caller cannot
@@ -277,9 +284,13 @@ export interface AdapterAuthSessionRow {
   promotionExpiresAt: Date | null;
   finishedAt: Date | null;
   failureReason: string | null;
+  /** The non-secret result claim of a terminal success, written atomically
+   *  with the terminal status. Null for failures and claim-less flows. */
+  resultClaim: Record<string, unknown> | null;
 }
 
 export interface InsertAdapterAuthSessionInput {
+  aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent;
   id: string;
   /** The public, CSPRNG session identifier. The service builds it and returns it
    *  to the client; the store persists it in `public_session_id`. */
@@ -303,6 +314,13 @@ export interface SetAdapterAuthSessionStatusInput {
    * unchanged. A `Date` sets a live claim; `null` clears the claim.
    */
   promotionExpiresAt?: Date | null;
+  /**
+   * The non-secret result claim to record with a terminal-success write.
+   * `undefined` leaves the column unchanged. Writing it in the SAME
+   * conditional write as the terminal status means a claim can never exist
+   * for a session that did not authenticate, and a restart never loses it.
+   */
+  resultClaim?: Record<string, unknown> | null;
 }
 
 /**
@@ -473,6 +491,7 @@ function isUniqueViolation(error: unknown): boolean {
 function toRow(row: typeof adapterAuthSessions.$inferSelect): AdapterAuthSessionRow {
   return {
     id: row.id,
+    ...(row.aiConnection ? { aiConnection: row.aiConnection } : {}),
     publicSessionId: row.publicSessionId,
     companyId: row.companyId,
     environmentId: row.environmentId,
@@ -487,6 +506,7 @@ function toRow(row: typeof adapterAuthSessions.$inferSelect): AdapterAuthSession
     promotionExpiresAt: row.promotionExpiresAt ?? null,
     finishedAt: row.finishedAt ?? null,
     failureReason: row.failureReason ?? null,
+    resultClaim: (row.resultClaim as Record<string, unknown> | null) ?? null,
   };
 }
 
@@ -501,6 +521,7 @@ function buildStatusPatch(input: SetAdapterAuthSessionStatusInput) {
     ...(input.promotionExpiresAt !== undefined
       ? { promotionExpiresAt: input.promotionExpiresAt }
       : {}),
+    ...(input.resultClaim !== undefined ? { resultClaim: input.resultClaim } : {}),
   };
 }
 
@@ -513,12 +534,13 @@ export function createDbAdapterAuthSessionStore(
   return {
     async insert(input) {
       try {
-        await db.insert(adapterAuthSessions).values({
+        await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx.insert(adapterAuthSessions).values({
           id: input.id,
           companyId: input.companyId,
           environmentId: input.environmentId,
           adapterType: input.adapterType,
           startedByUserId: input.startedByUserId,
+          aiConnection: input.aiConnection,
           // The unified table requires a unique public session id. The service
           // builds it from a CSPRNG and returns it to the client, so the store
           // persists that value here. It never uses the internal id, a timestamp,
@@ -528,7 +550,7 @@ export function createDbAdapterAuthSessionStore(
           expiresAt: input.expiresAt,
           createdAt: input.at,
           updatedAt: input.at,
-        });
+        }));
       } catch (error) {
         if (isUniqueViolation(error)) {
           throw new AdapterAuthSessionConflictError();
@@ -537,23 +559,23 @@ export function createDbAdapterAuthSessionStore(
       }
     },
     async recordLeaseAcquired(input) {
-      await db
+      await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set({ providerLeaseId: input.providerLeaseId, updatedAt: input.at })
-        .where(eq(adapterAuthSessions.id, input.sessionId));
+        .where(eq(adapterAuthSessions.id, input.sessionId)));
     },
     async setStatus(input) {
-      await db
+      await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set(buildStatusPatch(input))
-        .where(eq(adapterAuthSessions.id, input.sessionId));
+        .where(eq(adapterAuthSessions.id, input.sessionId)));
     },
     async compareAndSetStatus(input) {
       // The conditional write. It changes the row only when the current status is
       // one of `expectedStatuses`. The `returning` clause reports the changed
       // rows, so a lost race returns an empty array. The active-slot partial
       // unique index still serializes the company slot on the write.
-      const changed = await db
+      const changed = await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set(buildStatusPatch(input))
         .where(
@@ -562,7 +584,7 @@ export function createDbAdapterAuthSessionStore(
             inArray(adapterAuthSessions.status, [...input.expectedStatuses]),
           ),
         )
-        .returning({ id: adapterAuthSessions.id });
+        .returning({ id: adapterAuthSessions.id }));
       return changed.length > 0;
     },
     async get(sessionId) {
@@ -629,6 +651,7 @@ export function createDbAdapterAuthSessionStore(
             // The shared table also holds the setup-token rows, so every reaper
             // scan filters by the closed set of displayed-code adapter types.
             inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
+            sql`${adapterAuthSessions.connectionMethod} is distinct from 'local_subscription'`,
             inArray(adapterAuthSessions.status, [...ADAPTER_AUTH_ACTIVE_STATUSES]),
             isNotNull(adapterAuthSessions.expiresAt),
             lte(adapterAuthSessions.expiresAt, nowAt),
@@ -648,6 +671,7 @@ export function createDbAdapterAuthSessionStore(
         .where(
           and(
             inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
+            sql`${adapterAuthSessions.connectionMethod} is distinct from 'local_subscription'`,
             eq(adapterAuthSessions.status, "cleanup_pending"),
           ),
         );
@@ -919,6 +943,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
       environmentId: input.environmentId,
       adapterType: input.adapterType,
       startedByUserId: input.startedByUserId,
+      aiConnection: input.aiConnection,
       expiresAt,
       at: startedAt,
     });
@@ -1017,6 +1042,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
         failureReason?: string | null;
         finishedAt?: Date | null;
         promotionExpiresAt?: Date | null;
+        resultClaim?: Record<string, unknown> | null;
       },
     ): Promise<boolean> {
       const run = statusTail.then(
@@ -1121,7 +1147,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
       // Publish `authenticated` only when the final conditional write still finds
       // the held claim. A lost write means the claim expired and the reaper
       // reclaimed the row, so the service never publishes `authenticated`.
-      const commitAuthenticated = () =>
+      const commitAuthenticated = (resultClaim?: Record<string, unknown>) =>
         terminate({
           sessionId,
           lease,
@@ -1130,6 +1156,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
           expectedStatuses: ["promoting"],
           conditionalTransition,
           activity,
+          resultClaim: resultClaim ?? null,
         });
       const promotionContext: CredentialPromotionContext = {
         sessionId,
@@ -1218,9 +1245,12 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
         failureReason?: string | null;
         finishedAt?: Date | null;
         promotionExpiresAt?: Date | null;
+        resultClaim?: Record<string, unknown> | null;
       },
     ) => Promise<boolean>;
     activity: (phase: LoginSessionActivityPhase) => void;
+    /** The non-secret claim to record atomically with a terminal success. */
+    resultClaim?: Record<string, unknown> | null;
   }): Promise<DeviceLoginOutcome> {
     const { sessionId, lease, terminal, reason, expectedStatuses, conditionalTransition, activity } =
       ctx;
@@ -1249,6 +1279,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
       finishedAt,
       failureReason: write.failureReason,
       promotionExpiresAt: null,
+      ...(ctx.resultClaim !== undefined ? { resultClaim: ctx.resultClaim } : {}),
     });
     if (!committed) {
       // The reaper already terminated the row. Leave its terminal in place. The
@@ -1286,6 +1317,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
     const prompt = isOwner ? promptsBySession.get(row.id) ?? null : null;
     return {
       sessionId: row.publicSessionId,
+      ...(isOwner && row.aiConnection ? { aiConnection: row.aiConnection } : {}),
       environmentId: row.environmentId,
       status,
       expiresAt: row.expiresAt?.toISOString() ?? null,
@@ -1623,10 +1655,10 @@ export function createProductionLoginSessionRuntime(
       );
       // Tag the lease with the session identifier, so the reaper resolves an
       // orphan lease that no live session references. The tag carries no secret.
-      await environmentsSvc.updateLeaseMetadata(record.lease.id, {
+      await writeLoginCleanup(deps.db, DELIVERY_QUEUES.adapterLoginCleanup, tx => environmentService(tx).updateLeaseMetadata(record.lease.id, {
         ...(record.lease.metadata ?? {}),
         [LOGIN_LEASE_SESSION_TAG_KEY]: input.sessionId,
-      });
+      }));
       const sessionHome = sessionLoginHomePath(input.sessionId);
       const authPath = sessionCredentialPath(input.sessionId);
       const providerLeaseId = record.lease.providerLeaseId ?? record.lease.id;
