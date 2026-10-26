@@ -31,6 +31,7 @@ import {
   CONNECTION_INTENT_AGENT_GUIDANCE,
   CONNECTION_RUNTIME_TOOL_NAMES,
   envBindingSchema,
+  isSystemIssueDocumentKey,
   isToolConnectionAttentionHealth,
   type ChatProvider,
   type RoutineRevisionSnapshotV1,
@@ -50,9 +51,11 @@ import {
   companies,
   documentAnnotationComments,
   documentAnnotationThreads,
+  documents as documentsTable,
   heartbeatRuns,
   issueAttachments,
   issueComments,
+  issueDocuments,
   issuePlanDecompositions,
   issueRecoveryActions,
   issues,
@@ -2311,6 +2314,61 @@ export async function buildPaperclipWakePayload(input: {
   )
     return null;
 
+  // Fork patch (PR #6042), relocated here from heartbeat.ts when upstream split
+  // that file across services/heartbeat/*. Two issue-level lists that upstream's
+  // native support does not cover:
+  //  - attachments: upstream attaches descriptors per comment, and only for
+  //    comments inside this wake window (see attachmentsByCommentId below). An
+  //    attachment uploaded to the issue, or on an older comment, is invisible to
+  //    the agent. This list is issue-wide so it stays reachable.
+  //  - documents: upstream has no user-document descriptors in the wake payload
+  //    at all (issueDocuments only appears in run-lifecycle.ts).
+  const [issueAttachmentRows, userDocumentRows] = await Promise.all([
+    issueId
+      ? input.db
+          .select({
+            id: issueAttachments.id,
+            filename: assets.originalFilename,
+            contentType: assets.contentType,
+            byteSize: assets.byteSize,
+          })
+          .from(issueAttachments)
+          .innerJoin(assets, eq(assets.id, issueAttachments.assetId))
+          .where(
+            and(
+              eq(issueAttachments.issueId, issueId),
+              eq(issueAttachments.companyId, input.companyId),
+              eq(assets.companyId, input.companyId),
+            ),
+          )
+          .orderBy(asc(issueAttachments.createdAt))
+      : Promise.resolve([]),
+    issueId
+      ? input.db
+          .select({
+            key: issueDocuments.key,
+            title: documentsTable.title,
+            format: documentsTable.format,
+            body: documentsTable.latestBody,
+            updatedAt: documentsTable.updatedAt,
+          })
+          .from(issueDocuments)
+          .innerJoin(
+            documentsTable,
+            eq(documentsTable.id, issueDocuments.documentId),
+          )
+          .where(
+            and(
+              eq(issueDocuments.issueId, issueId),
+              eq(issueDocuments.companyId, input.companyId),
+              eq(documentsTable.companyId, input.companyId),
+            ),
+          )
+          .orderBy(asc(issueDocuments.key))
+          .then((rows) => rows.filter((r) => !isSystemIssueDocumentKey(r.key)))
+      : Promise.resolve([]),
+  ]);
+
   const commentRows =
     commentIds.length === 0
       ? []
@@ -2824,6 +2882,22 @@ export async function buildPaperclipWakePayload(input: {
           updatedAt: safeContinuationSummary.updatedAt.toISOString(),
         }
       : null,
+    attachments: issueAttachmentRows.map((a) => ({
+      id: a.id,
+      filename: a.filename,
+      contentType: a.contentType,
+      byteSize: a.byteSize,
+      contentPath: `/api/attachments/${a.id}/content`,
+    })),
+    documents: userDocumentRows.map((d) => ({
+      key: d.key,
+      title: d.title,
+      format: d.format,
+      body: d.body ? d.body.slice(0, 65_536) : null,
+      bodyTruncated: d.body ? d.body.length > 65_536 : false,
+      updatedAt:
+        d.updatedAt instanceof Date ? d.updatedAt.toISOString() : d.updatedAt,
+    })),
     commentIds,
     latestCommentId: commentIds[commentIds.length - 1] ?? null,
     comments,
