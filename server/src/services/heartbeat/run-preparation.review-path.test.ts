@@ -7,7 +7,9 @@ import { decideIssueReviewPathRecovery, REVIEW_PATH_RECOVERY_INSTRUCTION } from 
 const issueSummary = { id: "task-1", identifier: "TEST-1", title: "Finish the pull request review", description: "Check CI and the external review.", status: "in_review", priority: "medium", workMode: "standard" };
 
 async function buildWake(contextSnapshot: Record<string, unknown>) {
-  const db = { select: vi.fn(() => ({ from: () => ({ where: () => Promise.resolve([]) }) })) } as unknown as Db;
+  // `.from().where()` covers the issue lookup; `.from().innerJoin().where().orderBy()`
+  // covers the fork's issue-documents join. Both resolve to no rows.
+  const db = { select: vi.fn(() => ({ from: () => ({ where: () => Promise.resolve([]), innerJoin: () => ({ where: () => ({ orderBy: () => Promise.resolve([]) }) }) }) })) } as unknown as Db;
   return buildPaperclipWakePayload({ db, companyId: "company-1", issueSummary, contextSnapshot });
 }
 
