@@ -13,6 +13,7 @@ import { resolveDefaultAgentWorkspaceDir } from "../../home-paths.js";
 import {
   createHeartbeatWorkspaceResolver,
   ensureManagedProjectWorkspace,
+  isGitRepositoryAbsentStderr,
   WorkspaceValidationFailure,
 } from "./workspaces.js";
 
@@ -248,5 +249,45 @@ describe("heartbeat workspace module", () => {
     const result = await legacyEnsureManagedProjectWorkspace(input);
     expect(resolveGitAuth).toHaveBeenCalledTimes(2);
     expect(await fs.readFile(path.join(result.cwd, "README.md"), "utf8")).toBe("retry succeeded\n");
+  });
+});
+
+// Git words repository absence two ways, and which one it prints depends on the
+// mount table rather than on the directory: discovery stops at a filesystem
+// boundary unless GIT_DISCOVERY_ACROSS_FILESYSTEM is set. A workspace on its own
+// mount — a tmpfs /tmp, a bind mount, a separate data volume — therefore gets the
+// boundary wording for an ordinary empty directory.
+describe("git repository absence stderr", () => {
+  it("recognizes both of Git's definitive absence wordings", () => {
+    expect(isGitRepositoryAbsentStderr(
+      "fatal: not a git repository (or any of the parent directories): .git\n",
+    )).toBe(true);
+    expect(isGitRepositoryAbsentStderr(
+      "fatal: not a git repository (or any parent up to mount point /tmp)\n" +
+      "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+    )).toBe(true);
+    expect(isGitRepositoryAbsentStderr(
+      "fatal: not a git repository (or any parent up to mount point /mnt/data/workspaces)\r\n" +
+      "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\r\n",
+    )).toBe(true);
+  });
+
+  it("keeps damaged metadata, missing Git and I/O failures reportable", () => {
+    for (const stderr of [
+      "",
+      "fatal: detected dubious ownership in repository at '/srv/repo'\n",
+      "fatal: not a git repository: '.git'\n",
+      "error: object file .git/objects/ab/cdef is empty\n",
+      "fatal: cannot change to '/srv/gone': No such file or directory\n",
+      // Anchored on purpose: a boundary message with anything appended is not
+      // the same evidence, and a wrapper's own output must not qualify.
+      "fatal: not a git repository (or any of the parent directories): .git\nwarning: something else\n",
+      "git: command not found\n",
+      undefined,
+      null,
+      128,
+    ]) {
+      expect(isGitRepositoryAbsentStderr(stderr)).toBe(false);
+    }
   });
 });

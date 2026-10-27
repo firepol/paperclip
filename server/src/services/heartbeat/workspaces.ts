@@ -839,6 +839,24 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+// Git prints repository absence two ways, and the wording is a property of the
+// mount table rather than of the directory: discovery stops at a filesystem
+// boundary unless GIT_DISCOVERY_ACROSS_FILESYSTEM is set, so an ordinary empty
+// directory on its own mount (a tmpfs /tmp, a bind mount, a separate data
+// volume) reports the boundary form. Both are definitive absence results, and
+// hasNoGitMetadataInWorkspaceAncestors re-walks every ancestor up to / across
+// mount boundaries, so the boundary form is no weaker evidence than the other.
+// Both patterns stay anchored: appended output is different evidence.
+const GIT_REPOSITORY_ABSENT_STDERR = [
+  /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/,
+  /^fatal: not a git repository \(or any parent up to mount point [^\r\n]*\)\r?\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.\r?\n?$/,
+];
+
+export function isGitRepositoryAbsentStderr(stderr: unknown): boolean {
+  return typeof stderr === "string" &&
+    GIT_REPOSITORY_ABSENT_STDERR.some((pattern) => pattern.test(stderr));
+}
+
 async function probeGitWorktreeBase(cwd: string) {
   try {
     const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
@@ -852,8 +870,7 @@ async function probeGitWorktreeBase(cwd: string) {
     // the same message. Verify its absence too. Missing Git, permission errors,
     // corruption and I/O failures must remain reportable in Sentry.
     const notRepository = failure.code === 128 && failure.signal == null &&
-      typeof failure.stderr === "string" &&
-      /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/.test(failure.stderr) &&
+      isGitRepositoryAbsentStderr(failure.stderr) &&
       !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR &&
       await hasNoGitMetadataInWorkspaceAncestors(cwd);
     return { isCheckout: false, notRepository };
